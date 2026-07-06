@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-reachy"
+version = "0.1.0"
+description = "Embody a Hermes agent in the Reachy Mini robot: a WebSocket platform adapter (speech in / speech out) plus a bounded body tool (emote/dance/look/stop/head-tracking/chirp)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ai-ag2026" }]
+keywords = ["hermes-agent", "reachy-mini", "robotics", "voice", "plugin", "platform"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "websockets>=13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.8",
+]
+
+# Discovered by the Hermes plugin loader (pip source). The entry-point name ends in
+# "-platform" so the loader derives the gateway platform name "reachy" without importing.
+[project.entry-points."hermes_agent.plugins"]
+reachy-platform = "hermes_reachy"
+
+[project.urls]
+Homepage = "https://github.com/ai-ag2026/hermes-reachy"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hermes_reachy*"]
+
+[tool.setuptools.package-data]
+hermes_reachy = ["plugin.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"

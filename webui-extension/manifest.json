@@ -1,0 +1,57 @@
+{
+  "extensions": [
+    {
+      "id": "reachy-embodiment-panel",
+      "name": "Reachy Embodiment Panel",
+      "description": "Read-only Reachy Mini status panel. No movement, audio, microphone, or camera actions.",
+      "scripts": [
+        "assets/reachy-embodiment-panel.js"
+      ],
+      "stylesheets": [
+        "assets/reachy-embodiment-panel.css"
+      ],
+      "permissions": {
+        "storage": {
+          "owned": true
+        }
+      },
+      "settings_schema": [
+        {
+          "key": "enabled",
+          "type": "boolean",
+          "label": "Enable Reachy Embodiment Panel",
+          "default": true
+        },
+        {
+          "key": "visibility_mode",
+          "type": "enum",
+          "label": "Visibility",
+          "default": "attention",
+          "options": [
+            { "value": "attention", "label": "Show only when Reachy needs attention" },
+            { "value": "always", "label": "Always show trigger" },
+            { "value": "hidden", "label": "Hide trigger; hotkey/API only" }
+          ]
+        },
+        {
+          "key": "daemon_url",
+          "type": "string",
+          "label": "Reachy daemon URL",
+          "default": "http://reachy-mini.local:8000"
+        },
+        {
+          "key": "dashboard_url",
+          "type": "string",
+          "label": "Reachy dashboard URL",
+          "default": "http://reachy-mini.local:7860"
+        },
+        {
+          "key": "poll_seconds",
+          "type": "integer",
+          "label": "Polling interval (seconds)",
+          "default": 20
+        }
+      ]
+    }
+  ]
+}

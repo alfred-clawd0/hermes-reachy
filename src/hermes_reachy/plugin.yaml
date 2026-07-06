@@ -1,0 +1,34 @@
+name: reachy-platform
+label: Reachy
+kind: platform
+version: 0.1.0
+description: >
+  Reachy Mini robot platform + body tool for Hermes Agent. Runs a WebSocket server that the
+  robot's voice app connects to as a client: inbound STT-text frames become messages (the app
+  owns mic/STT/VAD); outbound agent text is streamed as "say" frames the app renders through
+  its own TTS pipeline. Because the WebSocket persists, async/background/cron delivery reaches
+  the robot natively. Also registers the `reachy_body` tool (emote / dance / look / stop /
+  head_tracking / chirp), executed with a client-side allowlist on the robot.
+author: ai-ag2026
+requires_env:
+  - name: REACHY_WS_PORT
+    description: "WebSocket server listen port (the robot voice app connects here)"
+    prompt: "Reachy WebSocket listen port (e.g. 8770)"
+    password: false
+optional_env:
+  - name: REACHY_WS_HOST
+    description: "Bind address for the WebSocket server (default 0.0.0.0)"
+    prompt: "Bind host (default 0.0.0.0)"
+    password: false
+  - name: REACHY_ALLOWED_ROBOTS
+    description: "Comma-separated robot ids allowed to connect (allowlist)"
+    prompt: "Allowed robot ids (comma-separated, or empty)"
+    password: false
+  - name: REACHY_ALLOW_ALL_ROBOTS
+    description: "Allow any robot id to talk to the bot (dev only — disables allowlist)"
+    prompt: "Allow all robots? (true/false)"
+    password: false
+  - name: REACHY_HOME_CHANNEL
+    description: "Default robot id for cron / notification (send_message, proactive) delivery"
+    prompt: "Home robot id (or empty)"
+    password: false

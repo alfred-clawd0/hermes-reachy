@@ -1,0 +1,84 @@
+{
+  "id": "reachy-embodiment-panel",
+  "name": "Reachy Embodiment Panel",
+  "description": "Read-only Reachy Mini status panel for Hermes WebUI. Probes the configured Reachy daemon/dashboard endpoints and summarizes body availability without moving, speaking, listening, or capturing camera frames.",
+  "version": "0.1.0",
+  "author": "ai-ag2026",
+  "assets": {
+    "scripts": [
+      "assets/reachy-embodiment-panel.js"
+    ],
+    "stylesheets": [
+      "assets/reachy-embodiment-panel.css"
+    ]
+  },
+  "capabilities": [
+    "manifest-bundle"
+  ],
+  "lifecycle": {
+    "webui_restart_required": false,
+    "sidecar_start_required": false,
+    "native_host_start_required": false,
+    "native_host_autostart": "none"
+  },
+  "screenshots": [],
+  "permissions": {
+    "webui_api": {
+      "read": [],
+      "write": []
+    },
+    "webui_navigation": false,
+    "dom": {
+      "owned": true,
+      "mutates_core_views": true
+    },
+    "storage": {
+      "owned": true,
+      "shared_webui_keys": []
+    },
+    "loopback_sidecar": false,
+    "native_host": false,
+    "filesystem": {
+      "arbitrary": false,
+      "serves_bundled_assets": true
+    },
+    "network_external": true
+  },
+  "settings_schema": [
+    {
+      "key": "enabled",
+      "type": "boolean",
+      "label": "Enable Reachy Embodiment Panel",
+      "default": true
+    },
+    {
+      "key": "visibility_mode",
+      "type": "enum",
+      "label": "Visibility",
+      "default": "attention",
+      "options": [
+        { "value": "attention", "label": "Show only when Reachy needs attention" },
+        { "value": "always", "label": "Always show trigger" },
+        { "value": "hidden", "label": "Hide trigger; hotkey/API only" }
+      ]
+    },
+    {
+      "key": "daemon_url",
+      "type": "string",
+      "label": "Reachy daemon URL",
+      "default": "http://reachy-mini.local:8000"
+    },
+    {
+      "key": "dashboard_url",
+      "type": "string",
+      "label": "Reachy dashboard URL",
+      "default": "http://reachy-mini.local:7860"
+    },
+    {
+      "key": "poll_seconds",
+      "type": "integer",
+      "label": "Polling interval (seconds)",
+      "default": 20
+    }
+  ]
+}
