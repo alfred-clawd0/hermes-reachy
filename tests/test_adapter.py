@@ -39,11 +39,7 @@ def test_tag_turn_origin():
 
 
 def test_check_requirements_env_gate(monkeypatch):
-    monkeypatch.delenv("REACHY_WS_PORT", raising=False)
-    # websockets is a declared dep; the gate then hinges on the port being set.
-    assert adapter.check_requirements() is False
-    monkeypatch.setenv("REACHY_WS_PORT", "8770")
-    assert adapter.check_requirements() is True
+    assert adapter.check_requirements() is adapter.WEBSOCKETS_AVAILABLE
 
 
 def test_env_enablement_seed(monkeypatch):

@@ -40,7 +40,9 @@ Everything is environment-driven — no hosts, ports, or ids are baked in:
 
 ```dotenv
 REACHY_WS_PORT=8770            # the robot voice app connects here (required)
-# REACHY_WS_HOST=0.0.0.0      # bind address (default 0.0.0.0)
+REACHY_WS_API_KEY=<random>      # shared secret sent in the initial hello frame
+# REACHY_WS_API_KEY_FILE=/path  # alternative: read the shared secret from a file
+# REACHY_WS_HOST=127.0.0.1     # keep loopback when the body app runs on this Mac
 # REACHY_ALLOWED_ROBOTS=      # comma-separated allowlist of robot ids
 # REACHY_ALLOW_ALL_ROBOTS=    # dev only: accept any robot id
 # REACHY_HOME_CHANNEL=        # default robot id for proactive / cron delivery + body tool
@@ -51,7 +53,7 @@ REACHY_WS_PORT=8770            # the robot voice app connects here (required)
 The robot voice app is the client. Frames are JSON.
 
 ```
-inbound  (app → adapter):  {"type":"hello","robot_id":"reachy"}
+inbound  (app → adapter):  {"type":"hello","robot_id":"reachy","api_key":"..."}
                            {"type":"stt","text":"...","turn_id":"t1","robot_id":"reachy"}
                            {"type":"interrupt","text":"...","robot_id":"reachy"}
                            {"type":"tool_result","tool_call_id":"...","result":{...}}

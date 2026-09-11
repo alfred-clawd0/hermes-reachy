@@ -16,9 +16,17 @@ requires_env:
     prompt: "Reachy WebSocket listen port (e.g. 8770)"
     password: false
 optional_env:
+  - name: REACHY_WS_API_KEY
+    description: "Shared API key used to authenticate the robot WebSocket"
+    prompt: "Reachy WebSocket API key"
+    password: true
+  - name: REACHY_WS_API_KEY_FILE
+    description: "Path to a file containing the shared WebSocket API key"
+    prompt: "Reachy WebSocket API key file"
+    password: false
   - name: REACHY_WS_HOST
-    description: "Bind address for the WebSocket server (default 0.0.0.0)"
-    prompt: "Bind host (default 0.0.0.0)"
+    description: "Bind address for the WebSocket server (default: 127.0.0.1)"
+    prompt: "Bind host (default: 127.0.0.1)"
     password: false
   - name: REACHY_ALLOWED_ROBOTS
     description: "Comma-separated robot ids allowed to connect (allowlist)"
