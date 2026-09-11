@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-reachy"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embody a Hermes agent in the Reachy Mini robot: a WebSocket platform adapter (speech in / speech out) plus a bounded body tool (emote/dance/look/stop/head-tracking/chirp)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,11 +19,17 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "websockets>=13",
+    # Tested on websockets 13.1-17.1. The adapter wraps a websockets internal (protocol.fail) to
+    # close oversized pre-auth frames with 1008: re-test before lifting the upper bound.
+    "websockets>=13,<18",
 ]
 
 [project.optional-dependencies]
 dev = [
+    # Gateway authz tests call GatewayAuthorizationMixin._is_user_authorized, which imports
+    # gateway.run -> agent.account_usage -> httpx. CI installs Hermes with --no-deps, so pin
+    # the only missing import to Hermes 0.20.5's own pin (pure-Python, with its transitives).
+    "httpx==0.28.1",
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "ruff>=0.8",
@@ -35,7 +41,8 @@ dev = [
 reachy-platform = "hermes_reachy"
 
 [project.urls]
-Homepage = "https://github.com/ai-ag2026/hermes-reachy"
+Homepage = "https://github.com/alfred-clawd0/hermes-reachy"
+Upstream = "https://github.com/ai-ag2026/hermes-reachy"
 
 [tool.setuptools.packages.find]
 where = ["src"]
