@@ -11,23 +11,24 @@ description: >
   "hello" frame. Also registers the `reachy_body` tool (emote / dance / look / stop /
   head_tracking / chirp), executed with a client-side allowlist on the robot.
 author: ai-ag2026
-# An API key is REQUIRED: REACHY_WS_API_KEY, or REACHY_WS_API_KEY_FILE instead. Hermes'
-# requires_env has no "one of" form, so the inline key is listed here (prompted at install;
-# leave it empty when using a key file) and the file variant under optional_env. The gateway
-# refuses to start the platform (validate_config) when neither yields a key.
+# An API key is REQUIRED: set REACHY_WS_API_KEY, or REACHY_WS_API_KEY_FILE instead (the inline key
+# wins when both are set). Both are listed under optional_env on purpose: Hermes checks every
+# requires_env name literally, so listing either one would report a setup that uses the other as
+# incomplete. The gateway's validate_config refuses to start the platform, with the reason in its
+# log, when neither yields a usable key.
 requires_env:
   - name: REACHY_WS_PORT
     description: "WebSocket server listen port (the robot voice app connects here)"
     prompt: "Reachy WebSocket listen port (e.g. 8770)"
     password: false
+optional_env:
   - name: REACHY_WS_API_KEY
-    description: "Shared secret the voice app sends as api_key in its first hello frame (required unless REACHY_WS_API_KEY_FILE is set)"
-    prompt: "Reachy WebSocket API key (leave empty to use REACHY_WS_API_KEY_FILE)"
+    description: "Shared secret the voice app sends as api_key in its first hello frame (this or REACHY_WS_API_KEY_FILE is required)"
+    prompt: "Reachy WebSocket API key (or empty to use REACHY_WS_API_KEY_FILE)"
     password: true
     secret: true
-optional_env:
   - name: REACHY_WS_API_KEY_FILE
-    description: "Path to a file holding the API key — the alternative to REACHY_WS_API_KEY (one of the two is required)"
+    description: "Path to a file holding the API key (this or REACHY_WS_API_KEY is required)"
     prompt: "Reachy WebSocket API key file (or empty)"
     password: false
   - name: REACHY_WS_HOST

@@ -60,7 +60,7 @@ def test_validate_config_accepts_inline_key(monkeypatch):
     assert reachy._api_key == SECRET.encode()
 
 
-def test_validate_config_accepts_key_file(monkeypatch, tmp_path):
+def test_validate_config_accepts_key_file_only(monkeypatch, tmp_path):
     key_file = tmp_path / "reachy.key"
     key_file.write_text(f"  {SECRET}\n", encoding="utf-8")
     monkeypatch.setenv("REACHY_WS_PORT", "8770")
@@ -90,6 +90,9 @@ def _invalid_setups(tmp_path):
         "port-zero": ({**key, "REACHY_WS_PORT": "0"}, {}, "outside 1-65535"),
         "port-too-large": ({**key, "REACHY_WS_PORT": "65536"}, {}, "outside 1-65535"),
         "port-negative": ({**key, "REACHY_WS_PORT": "-1"}, {}, "outside 1-65535"),
+        "malformed-allowlist-entry": (
+            {**port, **key, "REACHY_ALLOWED_ROBOTS": "reachy, robot one"}, {}, "invalid robot id(s) 'robot one'"
+        ),
     }
 
 
@@ -108,6 +111,7 @@ def _invalid_setups(tmp_path):
         "port-zero",
         "port-too-large",
         "port-negative",
+        "malformed-allowlist-entry",
     ],
 )
 def test_validate_config_rejects(case, monkeypatch, tmp_path, caplog):
@@ -187,6 +191,31 @@ def test_is_loopback():
     assert not adapter._is_loopback("reachy-host.local")
 
 
+# ── log-safe helpers ───────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "raw, problem",
+    [
+        ("", "empty frame"),
+        (b"   ", "empty frame"),
+        ('{"api_key":"' + SECRET, "invalid JSON"),
+        ("[" * 100_000, "invalid JSON"),  # deep nesting -> RecursionError, still a category
+        (f'["{SECRET}"]', "not a JSON object"),
+        ('{"type":"hello"}', ""),
+    ],
+)
+def test_decode_frame_reports_only_a_category(raw, problem):
+    frame, found = adapter.ReachyAdapter._decode_frame(raw)
+    assert found == problem
+    assert SECRET not in found
+    assert (frame == {"type": "hello"}) if not problem else (frame == {})
+
+
+def test_path_for_log_drops_the_query_string():
+    assert adapter._path_for_log(f"/robot/kitchen?api_key={SECRET}") == "/robot/kitchen"
+    assert adapter._path_for_log("/robot/<script>") == "<redacted>"
+    assert adapter._path_for_log("") == ""
+
+
 # ── registration ───────────────────────────────────────────────────────────
 def test_env_enablement_seed(monkeypatch):
     monkeypatch.delenv("REACHY_WS_PORT", raising=False)
@@ -211,8 +240,8 @@ def test_register_platform_registers_reachy():
     assert len(ctx.platforms) == 1
     p = ctx.platforms[0]
     assert p["name"] == "reachy"
-    assert p["required_env"][0] == "REACHY_WS_PORT"
-    assert "REACHY_WS_API_KEY" in p["required_env"]
+    # Only the port: either key variable satisfies the key requirement (validate_config).
+    assert p["required_env"] == ["REACHY_WS_PORT"]
     assert callable(p["adapter_factory"])
     assert callable(p["check_fn"])
     assert p["validate_config"] is adapter.validate_config

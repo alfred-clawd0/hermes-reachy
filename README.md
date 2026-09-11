@@ -62,9 +62,14 @@ REACHY_WS_API_KEY=<random>      # shared secret the app sends in its first hello
 ```
 
 Generate a key with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and give the
-same value to the voice app. The gateway refuses to start the platform — with the reason in its
-log — when the port is not a valid 1-65535 integer, or no key is configured, or the key file is
-missing, unreadable or empty.
+same value to the voice app. Exactly one of the two key variables is needed. The plugin manifest
+lists both as optional because Hermes' installer checks each required name literally, and a
+key-file-only setup would otherwise be reported as incomplete. The gateway refuses to start the
+platform, and logs why, when:
+- the port is not a valid 1-65535 integer;
+- no key is configured;
+- the key file is missing, unreadable or empty;
+- an allowlisted robot id is malformed.
 
 ### Where to bind
 
@@ -103,17 +108,27 @@ The robot voice app is the client. Frames are JSON.
 1. The **first** frame must be a hello, sent within **10 s** of connecting:
    `{"type":"hello","robot_id":"reachy","api_key":"<REACHY_WS_API_KEY>"}`.
    If `robot_id` is omitted, the last URL path segment is used (`ws://host:8770/robot/kitchen` →
-   `kitchen`), else `reachy`.
-2. The key is compared in constant time (any UTF-8 string works) and `robot_id` is checked against
+   `kitchen`), else `reachy`. A robot id is 1–64 characters from `A-Z a-z 0-9 _ . : @ -`.
+2. Until the hello is accepted, every frame is limited to **4 KiB** (a hello is ~100 bytes).
+   Don't pipeline larger frames right behind the hello; after it is accepted the limit is 1 MiB, and
+   anything bigger closes with websockets' standard 1009.
+3. The key is compared in constant time (any UTF-8 string works) and `robot_id` is checked against
    the allowlist.
-3. Any failure closes the socket with **1008 (policy violation)** and one of these reasons:
-   `hello timeout`, `hello required` (the first frame was not a hello), `api_key required`,
-   `authentication failed`, `invalid robot_id`, `robot not allowed`. These are configuration
-   errors, so a client should not reconnect in a tight loop on 1008.
-4. The `robot_id` is fixed for the life of the connection: later frames that carry a different
+4. Any failure closes the socket with **1008 (policy violation)** and one of these reasons:
+   `hello timeout`, `hello required` (the first frame was not a JSON-object hello),
+   `frame too large`, `api_key required`, `authentication failed`, `invalid robot_id`,
+   `robot not allowed`, or `too many pending connections` (at most 16 sockets may wait in the
+   hello phase at once). These are configuration or overload errors, so a client should back off
+   rather than reconnect in a tight loop on 1008.
+5. The `robot_id` is fixed for the life of the connection: later frames that carry a different
    `robot_id` are dropped, and a second hello is ignored.
-5. If a robot id authenticates while an earlier connection for the same id is still open, the
+6. If a robot id authenticates while an earlier connection for the same id is still open, the
    older socket is closed with `1000 superseded by a newer connection`, and the newest one wins.
+7. A `tool_result` only completes a `tool_call` that was sent to the same robot.
+
+The adapter never logs frame contents, keys or URL query strings. Its rejection logs name only a
+category (for example `invalid JSON`) and the peer or robot id, and websockets' own frame-level
+debug output is switched off because frames carry the key.
 
 ### Frames
 
