@@ -24,6 +24,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # Gateway authz tests call GatewayAuthorizationMixin._is_user_authorized, which imports
+    # gateway.run -> agent.account_usage -> httpx. CI installs Hermes with --no-deps, so pin
+    # the only missing import to Hermes 0.20.5's own pin (pure-Python, with its transitives).
+    "httpx==0.28.1",
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "ruff>=0.8",
