@@ -19,7 +19,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "websockets>=13",
+    # Tested on websockets 13.1-17.1. The adapter wraps a websockets internal (protocol.fail) to
+    # close oversized pre-auth frames with 1008: re-test before lifting the upper bound.
+    "websockets>=13,<18",
 ]
 
 [project.optional-dependencies]

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.config
 import os
 from types import SimpleNamespace
 
@@ -213,7 +214,7 @@ async def test_allowlist_rejects_unlisted_robot(serve, monkeypatch, caplog):
     async with _client(url) as ws:
         await _hello(ws)  # robot_id "reachy" is not on the list
         assert await _close_of(ws) == (1008, "robot not allowed")
-    assert "not allowed" in caplog.text
+    assert "robot_id not allowlisted" in caplog.text
     async with _client(url + "/robot/kitchen") as ws:
         await _hello(ws, robot_id=None)  # no robot_id: taken from the URL path
         await _stt(ws, "hi")
@@ -321,6 +322,8 @@ async def test_frame_contents_and_keys_are_never_logged(serve, caplog):
         json.dumps({"type": SECRET, "api_key": SECRET}),  # not a hello
         json.dumps({"type": "hello", "robot_id": "reachy", "api_key": SECRET + "-wrong"}),
         json.dumps({"type": "hello", "robot_id": SECRET + " x", "api_key": SECRET}),  # malformed id
+        json.dumps({"type": "hello", "robot_id": SECRET, "api_key": SECRET}),  # authenticated, id == key
+        json.dumps({"type": "hello", "robot_id": "not-listed", "api_key": SECRET}),  # not allowlisted
         json.dumps({"type": "hello", "api_key": SECRET, "pad": SECRET * 400}),  # oversized
     ]
     for probe in pre_auth_probes:
@@ -432,3 +435,146 @@ async def test_gateway_allowlist_wins_and_mismatch_is_logged(serve, monkeypatch,
     assert gateway_authorized(reachy, _source(reachy, "reachy")) is False
     monkeypatch.setenv("REACHY_ALLOWED_ROBOTS", "reachy")
     assert gateway_authorized(reachy, _source(reachy, "reachy")) is True
+
+
+
+async def test_robot_ids_containing_the_key_are_rejected_unlogged(serve, monkeypatch, caplog):
+    monkeypatch.setenv("REACHY_ALLOW_ALL_ROBOTS", "true")  # robot ids are client-chosen here
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger=LOGGER)
+    reachy, url, events = await serve(api_key=SECRET)
+    for robot_id in (SECRET, f"bot-{SECRET}"):
+        async with _client(url) as ws:
+            await _hello(ws, robot_id=robot_id, api_key=SECRET)
+            assert await _close_of(ws) == (1008, "invalid robot_id")
+    assert events == [] and reachy._robots == {}
+    assert "robot_id contains the API key" in caplog.text
+    assert SECRET not in caplog.text
+
+
+# ── logging reconfigured after start-up ────────────────────────────────────
+@pytest.fixture
+def restore_logging():
+    """Snapshot, and afterwards restore, the global logging configuration a test rewires."""
+    root = logging.getLogger()
+    saved_root = (root.level, list(root.handlers), list(root.filters))
+    saved = {
+        name: (lg.level, list(lg.handlers), lg.propagate, lg.disabled, list(lg.filters))
+        for name, lg in list(logging.Logger.manager.loggerDict.items())
+        if isinstance(lg, logging.Logger)
+    }
+    yield
+    root.setLevel(saved_root[0])
+    root.handlers[:] = saved_root[1]
+    root.filters[:] = saved_root[2]
+    for name, lg in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(lg, logging.Logger) and name in saved:
+            level, handlers, propagate, disabled, filters = saved[name]
+            lg.setLevel(level)
+            lg.handlers[:] = handlers
+            lg.propagate = propagate
+            lg.disabled = disabled
+            lg.filters[:] = filters
+
+
+class _Collect(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _rendered(record):
+    text = record.getMessage()
+    if record.exc_info:
+        text += logging.Formatter().formatException(record.exc_info)
+    return text
+
+
+async def test_secret_not_logged_after_logging_is_reconfigured(serve, restore_logging):
+    reachy, url, events = await serve(api_key=SECRET)  # the server exists BEFORE reconfiguration
+    logging.config.dictConfig({
+        "version": 1,
+        "disable_existing_loggers": False,
+        "loggers": {LOGGER: {"level": "DEBUG"}},
+        "root": {"level": "DEBUG"},
+    })
+    logging.basicConfig(level=logging.DEBUG, force=True)
+    # That reset the adapter's websockets logger to NOTSET, i.e. effectively DEBUG.
+    assert logging.getLogger(LOGGER + ".ws").getEffectiveLevel() == logging.DEBUG
+    collector = _Collect()
+    logging.getLogger().addHandler(collector)
+    async with _client(url) as ws:  # a NEW connection, created after the reconfiguration
+        await _hello(ws, api_key=SECRET)  # the authenticating hello carries the key
+        await ws.send('{"type":"stt","text":"' + SECRET)  # the adapter's DEBUG "invalid JSON"
+        await _stt(ws, "hi")
+        await _until(lambda: events)
+    async with _client(url) as ws:
+        await _hello(ws, api_key=SECRET + "-wrong")
+        assert (await _close_of(ws))[0] == 1008
+    await _until(lambda: not reachy._robots)
+    records = collector.records
+    assert any(r.name == LOGGER and r.levelno == logging.DEBUG for r in records)  # DEBUG capture was live
+    assert [r for r in records if r.name.startswith(LOGGER + ".ws") and r.levelno <= logging.DEBUG] == []
+    assert [(r.name, r.levelname) for r in records if SECRET in _rendered(r)] == []
+
+
+# ── pending tool calls and closed connections ──────────────────────────────
+@pytest.mark.parametrize("how", ["superseded", "dropped"])
+async def test_pending_tool_call_fails_fast_when_its_connection_closes(how, serve):
+    reachy, url, _ = await serve()
+    loop = asyncio.get_running_loop()
+    async with _client(url) as old:
+        await _hello(old)
+        await _until(lambda: "reachy" in reachy._robots)
+        call = asyncio.create_task(reachy.call_robot_tool("reachy", "emote", {"emotion": "happy"}, timeout_s=10))
+        request = json.loads(await asyncio.wait_for(old.recv(), timeout=5.0))
+        assert request["type"] == "tool_call"
+        started = loop.time()
+        if how == "superseded":
+            async with _client(url) as new:
+                await _hello(new)
+                result = await asyncio.wait_for(call, timeout=5.0)
+        else:
+            await old.close()
+            result = await asyncio.wait_for(call, timeout=5.0)
+    assert result == {"ok": False, "error": "robot disconnected"}
+    assert loop.time() - started < 5.0  # not the 10 s call timeout
+    assert reachy._tool_futures == {}
+
+
+async def test_replacement_connection_may_still_answer_a_pending_call():
+    reachy = adapter.ReachyAdapter(adapter.PlatformConfig(enabled=True, extra={"port": 8770, "api_key": KEY}))
+    old_socket, fut = object(), asyncio.get_running_loop().create_future()
+    reachy._tool_futures["t1"] = ("reachy", old_socket, fut)
+    # The replacement connection (same robot) answers before the old socket finishes closing...
+    reachy._resolve_tool_result("reachy", {"tool_call_id": "t1", "result": {"ok": True}})
+    reachy._fail_pending_calls(old_socket)
+    assert fut.result() == {"ok": True}  # ...and its answer stands
+
+
+async def test_oversize_mapping_fails_safe_when_websockets_changes(serve, monkeypatch, caplog):
+    import websockets.protocol
+
+    real_fail = websockets.protocol.Protocol.fail
+
+    def changed_fail(self, code, reason="", **kwargs):
+        # A release whose fail() no longer accepts the call the adapter's hook makes.
+        if int(code) == 1008 and reason == "frame too large":
+            raise TypeError("fail() got an unexpected keyword argument")
+        return real_fail(self, code, reason)
+
+    monkeypatch.setattr(websockets.protocol.Protocol, "fail", changed_fail)
+    monkeypatch.setattr(adapter, "_hook_fallback_logged", False)
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    reachy, url, _ = await serve()
+    for _ in range(2):
+        async with _client(url, compression=None) as ws:
+            await _hello(ws, pad="x" * (2 * adapter.HELLO_MAX_BYTES))
+            assert (await _close_of(ws))[0] == 1009  # the library's own handling
+    await _until(lambda: reachy._pending == 0 and caplog.text.count("frame too large") >= 2)
+    assert caplog.text.count("cannot map oversized pre-auth frames") == 1  # logged once
+    assert "auth rejected" in caplog.text
+    await asyncio.wait_for(reachy.disconnect(), timeout=5.0)  # shutdown isn't stalled

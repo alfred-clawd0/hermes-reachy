@@ -51,3 +51,17 @@ def test_hermes_installer_accepts_a_key_file_only_setup(monkeypatch):
     # missing REACHY_WS_API_KEY.
     nagging = {**manifest, "requires_env": [*manifest["requires_env"], {"name": "REACHY_WS_API_KEY"}]}
     assert plugins_cmd._missing_requires_env_names(nagging) == ["REACHY_WS_API_KEY"]
+
+
+def test_websockets_dependency_has_a_tested_upper_bound():
+    import tomllib
+
+    import websockets
+    from packaging.specifiers import SpecifierSet
+
+    deps = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
+    spec = SpecifierSet(next(d for d in deps if d.startswith("websockets"))[len("websockets"):])
+    # The adapter relies on websockets internals (protocol.fail, the message-size attributes)
+    # verified on 13.1-17.1; an untested major must be an explicit, re-tested bump.
+    assert spec == SpecifierSet(">=13,<18")
+    assert websockets.__version__ in spec

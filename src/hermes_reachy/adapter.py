@@ -21,8 +21,9 @@ larger than ``HELLO_MAX_BYTES``. Its ``robot_id`` must be allowlisted (``REACHY_
 default ``reachy``; ``REACHY_ALLOW_ALL_ROBOTS`` accepts any id but still needs the key) and stays
 fixed for the life of the connection. Any failure closes the socket with 1008 (policy
 violation), as does arriving while ``MAX_PENDING_CONNECTIONS`` sockets already await their hello.
-Frame contents and keys are never logged. The gateway's own allowlist / allow-all / pairing
-checks still run on every message — see ``ReachyAdapter.enforces_own_access_policy``.
+Frame contents, keys, rejected identities and configuration values are never logged. The
+gateway's own allowlist / allow-all / pairing checks still run on every message — see
+``ReachyAdapter.enforces_own_access_policy``.
 
 An inbound "stt"/"interrupt" frame becomes a MessageEvent dispatched via
 ``handle_message``. Because the gateway's default busy-input mode is ``interrupt``,
@@ -77,9 +78,6 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
-# websockets' own logger, held at INFO in connect(): its DEBUG output dumps frames, and frames
-# carry the API key.
-_WS_LOGGER = logging.getLogger(__name__ + ".ws")
 
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_ROBOT_ID = "reachy"
@@ -103,7 +101,7 @@ CLOSE_MESSAGE_TOO_BIG = 1009
 _TRUTHY = frozenset({"true", "1", "yes"})
 # Robot ids are identities that end up in logs, session keys and allowlists: keep them plain.
 _ROBOT_ID_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
-_LOGGABLE_PATH_RE = re.compile(r"[A-Za-z0-9_./:@-]{0,128}")
+_ROBOT_ID_RULE = "robot ids are 1-64 characters from A-Z a-z 0-9 _ . : @ -"
 
 # Correlates outbound frames to the turn that produced them. Set around handle_message()
 # in _dispatch_text; asyncio.create_task copies the current context, so the turn's detached
@@ -138,31 +136,102 @@ class _HandshakeNoiseFilter(logging.Filter):
         return "opening handshake failed" not in msg and "did not receive a valid HTTP request" not in msg
 
 
-class _ReachyConnection(ServerConnection):
-    """Server connection that keeps the hello contract for oversized frames.
+class _NoDebugLogger(logging.LoggerAdapter):
+    """The logger handed to websockets: it never enables or emits DEBUG, whatever the logging
+    configuration says. websockets' DEBUG output dumps frames, and frames carry the API key.
 
-    Until the robot authenticates, the protocol's message limit is ``HELLO_MAX_BYTES``
-    (``serve(max_size=...)``). websockets rejects an oversized message inside its frame parser
-    by calling ``protocol.fail(1009)``; while unauthenticated this wrapper turns that into
-    1008 "frame too large" and flags it so the handler logs an auth rejection. It is installed
-    when the connection is built, so it also covers frames that arrive before the handler runs.
-    ``_handle_conn`` raises the limit to ``MAX_MESSAGE_BYTES`` after the hello; from then on an
-    oversized frame closes with the library's usual 1009.
+    A level on the underlying logger is not enough: e.g. ``logging.config.dictConfig`` resets
+    it to NOTSET when it configures a parent. websockets decides once per connection with
+    ``isEnabledFor(DEBUG)`` and wraps this object in its own ``LoggerAdapter``, whose calls
+    delegate here — so both the decision and every record pass through this class.
     """
+
+    def isEnabledFor(self, level: int) -> bool:
+        return level > logging.DEBUG and self.logger.isEnabledFor(level)
+
+    def log(self, level: int, msg: object, *args: Any, **kwargs: Any) -> None:
+        if level > logging.DEBUG:
+            super().log(level, msg, *args, **kwargs)
+
+    def process(self, msg: Any, kwargs: Any) -> tuple[Any, Any]:
+        return msg, kwargs  # keep websockets' own ``extra`` (the base class would replace it)
+
+
+_WS_LOGGER = _NoDebugLogger(logging.getLogger(__name__ + ".ws"))
+
+# Set once the size hook below has had to fall back, so the warning is logged only once.
+_hook_fallback_logged = False
+
+
+def _warn_hook_fallback(why: str) -> None:
+    global _hook_fallback_logged
+    if not _hook_fallback_logged:
+        _hook_fallback_logged = True
+        logger.warning(
+            "[reachy] cannot map oversized pre-auth frames to 1008 on this websockets release "
+            "(%s); they close with the library's 1009 instead",
+            why,
+        )
+
+
+def _install_hello_size_hook(conn: Any) -> None:
+    """Make an oversized pre-auth frame close with 1008 "frame too large", not 1009.
+
+    websockets rejects an oversized message inside its frame parser by calling
+    ``protocol.fail(1009, ...)``; there is no public hook to choose the code. This wraps that
+    connection's ``protocol.fail``: while ``conn.authenticated`` is False it re-issues the call
+    with 1008 / "frame too large" (keeping any other arguments) and sets
+    ``conn.hello_too_large``. ``protocol.fail`` is a websockets internal — stable in 13-17,
+    hence the ``<18`` pin — so the wrapper fails safe: if the attribute is missing or the
+    re-issued call is rejected, the library's own handling (1009) runs, with one warning.
+    """
+    protocol = getattr(conn, "protocol", None)
+    original = getattr(protocol, "fail", None)
+    if not callable(original):
+        _warn_hook_fallback("protocol.fail is missing")
+        return
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        code = kwargs["code"] if "code" in kwargs else (args[0] if args else None)
+        if code != CLOSE_MESSAGE_TOO_BIG or getattr(conn, "authenticated", True):
+            return original(*args, **kwargs)
+        mapped_args, mapped_kwargs = list(args), dict(kwargs)
+        if "code" in mapped_kwargs:
+            mapped_kwargs["code"] = CLOSE_POLICY_VIOLATION
+        else:
+            mapped_args[0] = CLOSE_POLICY_VIOLATION
+        if "reason" in mapped_kwargs:
+            mapped_kwargs["reason"] = "frame too large"
+        elif len(mapped_args) > 1:
+            mapped_args[1] = "frame too large"
+        else:
+            mapped_kwargs["reason"] = "frame too large"
+        try:
+            result = original(*mapped_args, **mapped_kwargs)
+        except (TypeError, AttributeError):
+            _warn_hook_fallback("unexpected protocol.fail() signature")
+            return original(*args, **kwargs)
+        conn.hello_too_large = True
+        return result
+
+    try:
+        protocol.fail = fail
+    except AttributeError:  # e.g. a release that makes the protocol slotted
+        _warn_hook_fallback("protocol.fail is read-only")
+
+
+class _ReachyConnection(ServerConnection):
+    """Server connection that keeps the hello contract for oversized frames (see
+    ``_install_hello_size_hook``). The hook is installed when the connection is built, so it
+    also covers frames that arrive before the handler runs. ``_handle_conn`` marks the
+    connection authenticated and raises its limit to ``MAX_MESSAGE_BYTES`` after the hello;
+    from then on an oversized frame closes with the library's usual 1009."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.authenticated = False
         self.hello_too_large = False
-        protocol_fail = self.protocol.fail
-
-        def fail(code: int, reason: str = "") -> None:
-            if code == CLOSE_MESSAGE_TOO_BIG and not self.authenticated:
-                self.hello_too_large = True
-                code, reason = CLOSE_POLICY_VIOLATION, "frame too large"
-            protocol_fail(code, reason)
-
-        self.protocol.fail = fail
+        _install_hello_size_hook(self)
 
 
 def _set_message_limit(websocket: Any, limit: int) -> None:
@@ -176,7 +245,8 @@ def _set_message_limit(websocket: Any, limit: int) -> None:
 
 # ── configuration ──────────────────────────────────────────────────────────
 class ReachyConfigError(ValueError):
-    """The Reachy platform configuration is unusable; the message says why (never the key)."""
+    """The Reachy platform configuration is unusable. The message names the setting and the
+    problem, never a configured value (a value may be, or contain, the key)."""
 
 
 @dataclass(frozen=True)
@@ -202,6 +272,10 @@ def _key_bytes(key: str) -> bytes:
     return key.encode("utf-8", "surrogatepass")
 
 
+def _os_error_text(exc: BaseException) -> str:
+    return (exc.strerror if isinstance(exc, OSError) else None) or type(exc).__name__
+
+
 def _parse_port(raw: Any) -> int:
     text = str(raw).strip()
     if not text:
@@ -209,9 +283,9 @@ def _parse_port(raw: Any) -> int:
     try:
         port = int(text)
     except ValueError:
-        raise ReachyConfigError(f"REACHY_WS_PORT={text!r} is not an integer") from None
+        raise ReachyConfigError("REACHY_WS_PORT is not an integer") from None
     if not 1 <= port <= 65535:
-        raise ReachyConfigError(f"REACHY_WS_PORT={port} is outside 1-65535")
+        raise ReachyConfigError("REACHY_WS_PORT is outside 1-65535")
     return port
 
 
@@ -225,21 +299,20 @@ def _load_api_key(extra: dict[str, Any]) -> bytes:
     key_file = str(_setting(extra, "api_key_file", "REACHY_WS_API_KEY_FILE")).strip()
     if not key_file:
         raise ReachyConfigError("no API key configured: set REACHY_WS_API_KEY or REACHY_WS_API_KEY_FILE")
-    path = Path(key_file).expanduser()
     try:
-        key = path.read_text(encoding="utf-8").strip()
+        key = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
     except OSError as exc:
-        raise ReachyConfigError(f"API key file {path} is unreadable: {exc.strerror or exc}") from None
+        raise ReachyConfigError(f"REACHY_WS_API_KEY_FILE is unreadable: {_os_error_text(exc)}") from None
     except UnicodeDecodeError:
-        raise ReachyConfigError(f"API key file {path} is not valid UTF-8") from None
+        raise ReachyConfigError("REACHY_WS_API_KEY_FILE is not valid UTF-8") from None
     if not key:
-        raise ReachyConfigError(f"API key file {path} is empty")
+        raise ReachyConfigError("REACHY_WS_API_KEY_FILE is empty")
     return _key_bytes(key)
 
 
-def _parse_robot_ids(raw: Any) -> frozenset[str]:
+def _split_robot_ids(raw: Any) -> list[str]:
     items = raw.split(",") if isinstance(raw, str) else [str(item) for item in raw or ()]
-    return frozenset(item.strip() for item in items if item.strip())
+    return [item.strip() for item in items if item.strip()]
 
 
 def _load_settings(config: Any) -> _Settings:
@@ -249,22 +322,22 @@ def _load_settings(config: Any) -> _Settings:
     host = str(_setting(extra, "host", "REACHY_WS_HOST")).strip() or DEFAULT_HOST
     api_key = _load_api_key(extra)
     # Env first, like the gateway's own allowlist check, so both layers see the same list.
-    raw_robots = os.getenv("REACHY_ALLOWED_ROBOTS", "")
+    source, raw_robots = "REACHY_ALLOWED_ROBOTS", os.getenv("REACHY_ALLOWED_ROBOTS", "")
     if not raw_robots.strip():
-        raw_robots = extra.get("allowed_robots") or ""
-    robots = _parse_robot_ids(raw_robots)
-    invalid = sorted(robot for robot in robots if not _ROBOT_ID_RE.fullmatch(robot))
-    if invalid:
-        raise ReachyConfigError(
-            f"REACHY_ALLOWED_ROBOTS has invalid robot id(s) {', '.join(map(repr, invalid))}: "
-            "use 1-64 characters from A-Z a-z 0-9 _ . : @ -"
-        )
+        source, raw_robots = "allowed_robots", extra.get("allowed_robots") or ""
+    robots = _split_robot_ids(raw_robots)
+    for position, robot in enumerate(robots, 1):
+        # Name the entry by position only: the value itself may be the key pasted by mistake.
+        if not _ROBOT_ID_RE.fullmatch(robot):
+            raise ReachyConfigError(f"{source} entry #{position} is malformed: {_ROBOT_ID_RULE}")
+        if api_key in _key_bytes(robot):
+            raise ReachyConfigError(f"{source} entry #{position} contains the API key")
     return _Settings(
         host=host,
         port=port,
         api_key=api_key,
         # Unset, empty or all-blank means the default robot — never an empty allowlist.
-        allowed_robots=robots or frozenset({DEFAULT_ROBOT_ID}),
+        allowed_robots=frozenset(robots) or frozenset({DEFAULT_ROBOT_ID}),
         # Env only: it is the exact flag the gateway's allow-all check reads.
         allow_all_robots=os.getenv("REACHY_ALLOW_ALL_ROBOTS", "").strip().lower() in _TRUTHY,
     )
@@ -279,17 +352,16 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
+def _format_sockaddr(addr: Any) -> str:
+    host, port = str(addr[0]), addr[1]
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def _peer(websocket: Any) -> str:
     addr = getattr(websocket, "remote_address", None)
     if isinstance(addr, tuple) and len(addr) >= 2:
-        return f"{addr[0]}:{addr[1]}"
+        return _format_sockaddr(addr)
     return "unknown peer"
-
-
-def _path_for_log(path: str) -> str:
-    """The request path without its query string (clients may put tokens there)."""
-    bare = (path or "").split("?", 1)[0]
-    return bare if _LOGGABLE_PATH_RE.fullmatch(bare) else "<redacted>"
 
 
 def check_requirements() -> bool:
@@ -357,8 +429,8 @@ class ReachyAdapter(BasePlatformAdapter):
         self._robots: Dict[str, Any] = {}
         # robot_id -> turn_id of the most recently dispatched client turn (see _current_turn_id)
         self._turn_ids: Dict[str, str] = {}
-        # tool_call_id -> (robot_id it was sent to, Future awaiting that robot's tool_result)
-        self._tool_futures: dict[str, tuple[str, asyncio.Future]] = {}
+        # tool_call_id -> (robot_id it was sent to, the socket it went out on, Future for the result)
+        self._tool_futures: dict[str, tuple[str, Any, asyncio.Future]] = {}
         # strong refs to in-flight closes of superseded connections
         self._closing: set[asyncio.Task] = set()
         # sockets still in the hello phase, and rate-limit state for the overflow warning
@@ -378,26 +450,27 @@ class ReachyAdapter(BasePlatformAdapter):
         admits robot ids listed in GATEWAY_ALLOWED_USERS — say so instead of failing silently."""
         if self._allow_all_robots or os.getenv("REACHY_ALLOWED_ROBOTS", "").strip():
             return
-        gateway_ids = _parse_robot_ids(os.getenv("GATEWAY_ALLOWED_USERS", ""))
+        gateway_ids = frozenset(_split_robot_ids(os.getenv("GATEWAY_ALLOWED_USERS", "")))
         if not gateway_ids or "*" in gateway_ids:
             return
-        denied = sorted(self._allowed_robots - gateway_ids)
+        denied = len(self._allowed_robots - gateway_ids)
         if denied:
             logger.warning(
                 "[reachy] GATEWAY_ALLOWED_USERS is set but REACHY_ALLOWED_ROBOTS is not: the "
-                "gateway will deny robot id(s) %s — set REACHY_ALLOWED_ROBOTS explicitly",
-                ", ".join(denied),
+                "gateway will deny %d allowlisted robot id(s) missing from GATEWAY_ALLOWED_USERS "
+                "— set REACHY_ALLOWED_ROBOTS explicitly",
+                denied,
             )
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not WEBSOCKETS_AVAILABLE:
-            logger.warning("[reachy] websockets not installed (pip install websockets)")
+            logger.warning("[reachy] websockets not installed (pip install 'websockets>=13,<18')")
             return False
-        _WS_LOGGER.setLevel(logging.INFO)  # never dump frames (they carry the key)
         # keep the gateway journal clean of non-ws probe tracebacks
-        if not any(isinstance(f, _HandshakeNoiseFilter) for f in _WS_LOGGER.filters):
-            _WS_LOGGER.addFilter(_HandshakeNoiseFilter())
+        ws_logger = _WS_LOGGER.logger
+        if not any(isinstance(f, _HandshakeNoiseFilter) for f in ws_logger.filters):
+            ws_logger.addFilter(_HandshakeNoiseFilter())
         try:
             self._server = await ws_serve(
                 self._handle_conn,
@@ -408,7 +481,10 @@ class ReachyAdapter(BasePlatformAdapter):
                 create_connection=_ReachyConnection,
             )
         except Exception as e:  # pragma: no cover - bind failure path
-            logger.error("[reachy] failed to start ws server on %s:%s: %s", self._host, self._port, e)
+            logger.error(
+                "[reachy] failed to start the ws server on REACHY_WS_HOST / REACHY_WS_PORT: %s",
+                _os_error_text(e),
+            )
             return False
         self._mark_connected()
         global _ACTIVE_ADAPTER
@@ -416,12 +492,13 @@ class ReachyAdapter(BasePlatformAdapter):
         # The adapter's home loop: tool handlers may run in a DIFFERENT loop (the registry's
         # async bridge) — call_robot_tool must execute here or its future never wakes.
         self._loop = asyncio.get_running_loop()
-        logger.info("[reachy] ws server listening on %s:%s", self._host, self._port)
-        if not _is_loopback(self._host):
+        # Log the addresses actually bound (OS-reported), not the configured host string.
+        bound = [sock.getsockname() for sock in self._server.sockets]
+        logger.info("[reachy] ws server listening on %s", ", ".join(_format_sockaddr(a) for a in bound))
+        if any(not _is_loopback(str(addr[0])) for addr in bound):
             logger.warning(
-                "[reachy] listening on non-loopback %s: ws:// carries the API key in plaintext — "
-                "prefer an SSH tunnel or a TLS proxy",
-                self._host,
+                "[reachy] listening on a non-loopback address: ws:// carries the API key in plaintext — "
+                "prefer an SSH tunnel or a TLS proxy"
             )
         self._warn_if_gateway_denies_robots()
         return True
@@ -477,7 +554,7 @@ class ReachyAdapter(BasePlatformAdapter):
             task = asyncio.create_task(previous.close(CLOSE_NORMAL, "superseded by a newer connection"))
             self._closing.add(task)
             task.add_done_callback(self._closing.discard)
-        logger.info("[reachy] robot connected: %s (path=%s)", robot_id, _path_for_log(path))
+        logger.info("[reachy] robot connected: %s", robot_id)
         try:
             async for raw in websocket:
                 await self._on_inbound(robot_id, raw)
@@ -487,6 +564,8 @@ class ReachyAdapter(BasePlatformAdapter):
             # type only: exception text (e.g. a close reason) is client-controlled
             logger.debug("[reachy] connection loop ended for %s: %s", robot_id, type(e).__name__)
         finally:
+            # Tool calls that went out on this socket can no longer be answered through it.
+            self._fail_pending_calls(websocket)
             # only drop the mapping if it still points at this socket
             if self._robots.get(robot_id) is websocket:
                 self._robots.pop(robot_id, None)
@@ -511,14 +590,16 @@ class ReachyAdapter(BasePlatformAdapter):
         self._last_pending_log = now
 
     async def _authenticate(self, websocket: Any, path: str) -> str | None:
-        """Run the hello handshake: return the admitted robot id, or None once closed."""
+        """Run the hello handshake: return the admitted robot id, or None once closed.
+        Rejections log a category and the peer, never a value taken from the frame."""
         try:
             raw = await asyncio.wait_for(websocket.recv(), timeout=HELLO_TIMEOUT_S)
         except TimeoutError:
             return await self._reject(websocket, f"no hello within {HELLO_TIMEOUT_S:g}s", "hello timeout")
         except ConnectionClosed:
-            if getattr(websocket, "hello_too_large", False):
-                # _ReachyConnection already closed it with 1008 "frame too large".
+            close_sent = getattr(getattr(websocket, "protocol", None), "close_sent", None)
+            if getattr(websocket, "hello_too_large", False) or getattr(close_sent, "code", None) == CLOSE_MESSAGE_TOO_BIG:
+                # Closed by the protocol itself: 1008 via the size hook, or 1009 if it fell back.
                 logger.warning(
                     "[reachy] auth rejected from %s: first frame over %d bytes (frame too large)",
                     _peer(websocket),
@@ -543,8 +624,11 @@ class ReachyAdapter(BasePlatformAdapter):
         robot_id = (claimed or "").strip() or self._robot_id_from_path(path)
         if not _ROBOT_ID_RE.fullmatch(robot_id):
             return await self._reject(websocket, "malformed robot_id", "invalid robot_id")
+        # Admitted ids are logged; one carrying the key (possible under allow-all) never is.
+        if self._api_key in _key_bytes(robot_id):
+            return await self._reject(websocket, "robot_id contains the API key", "invalid robot_id")
         if not self._robot_allowed(robot_id):
-            return await self._reject(websocket, f"robot id {robot_id!r} not allowed", "robot not allowed")
+            return await self._reject(websocket, "robot_id not allowlisted", "robot not allowed")
         return robot_id
 
     @staticmethod
@@ -584,18 +668,26 @@ class ReachyAdapter(BasePlatformAdapter):
             logger.debug("[reachy] ignored a frame of unhandled type from %s", robot_id)
 
     def _resolve_tool_result(self, robot_id: str, frame: dict[str, Any]) -> None:
-        """Complete a pending tool call — only for the robot it was sent to."""
+        """Complete a pending tool call — only for the robot it was sent to (on any of its
+        connections, so a replacement socket may still answer)."""
         pending = self._tool_futures.get(str(frame.get("tool_call_id") or "").strip())
         if pending is None:
             logger.debug("[reachy] tool_result from %s matches no pending call", robot_id)
             return
-        owner, fut = pending
+        owner, _socket, fut = pending
         if owner != robot_id:
             logger.warning("[reachy] ignored tool_result from %s for a call sent to %s", robot_id, owner)
             return
         if not fut.done():
             result = frame.get("result")
             fut.set_result(result if isinstance(result, dict) else {})
+
+    def _fail_pending_calls(self, websocket: Any) -> None:
+        """Fail, at once, the still-open tool calls that were sent on a socket that has closed
+        (superseded or dropped), instead of letting them run into their timeout."""
+        for _owner, socket, fut in list(self._tool_futures.values()):
+            if socket is websocket and not fut.done():
+                fut.set_result({"ok": False, "error": "robot disconnected"})
 
     @staticmethod
     def _decode_frame(raw: Any) -> tuple[dict[str, Any], str]:
@@ -669,12 +761,15 @@ class ReachyAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Body-tool surface: push a tool_call frame to the robot app and
         await its tool_result. The app executes through its MovementManager/tool registry with
-        a client-side allowlist; this side only correlates request and response."""
-        if robot_id not in self._robots:
+        a client-side allowlist; this side only correlates request and response. A call whose
+        connection closes before the answer fails at once with ``{"ok": False, "error":
+        "robot disconnected"}``."""
+        ws = self._robots.get(robot_id)
+        if ws is None:
             return {"error": f"robot {robot_id} not connected"}
         tcid = uuid.uuid4().hex
         fut: "asyncio.Future" = asyncio.get_running_loop().create_future()
-        self._tool_futures[tcid] = (robot_id, fut)
+        self._tool_futures[tcid] = (robot_id, ws, fut)
         try:
             ok = await self._push(
                 robot_id,
@@ -840,7 +935,7 @@ def register_platform(ctx) -> None:
         # Hermes checks required_env names literally, so neither key alternative is listed: the
         # key (REACHY_WS_API_KEY or REACHY_WS_API_KEY_FILE) is enforced by validate_config.
         required_env=["REACHY_WS_PORT"],
-        install_hint="pip install websockets",
+        install_hint="pip install 'websockets>=13,<18'",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="REACHY_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,

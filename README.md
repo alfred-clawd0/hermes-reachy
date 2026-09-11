@@ -50,6 +50,10 @@ git clone https://github.com/alfred-clawd0/hermes-reachy.git && cd hermes-reachy
 pip install -e .
 ```
 
+Supported websockets releases are 13.x through 17.x (`websockets>=13,<18`). The adapter maps oversized
+pre-auth frames to 1008 through a websockets internal, which was verified on those releases. If a later
+release changes it, the adapter falls back to the library's own 1009 and logs a warning once.
+
 The Hermes plugin loader discovers it through the `hermes_agent.plugins` entry point. Alternatively
 drop `src/hermes_reachy/` into `~/.hermes/plugins/reachy/` (directory plugin).
 
@@ -130,11 +134,18 @@ The robot voice app is the client. Frames are JSON.
    `robot_id` are dropped, and a second hello is ignored.
 6. If a robot id authenticates while an earlier connection for the same id is still open, the
    older socket is closed with `1000 superseded by a newer connection`, and the newest one wins.
-7. A `tool_result` only completes a `tool_call` that was sent to the same robot.
+7. A `tool_result` only completes a `tool_call` that was sent to the same robot. If a call is still
+   pending when its connection closes (superseded or dropped), it fails at once with
+   `{"ok": false, "error": "robot disconnected"}`, unless the robot's replacement connection has
+   already answered it.
+8. A `robot_id` that contains the API key is rejected (`invalid robot_id`).
 
-The adapter never logs frame contents, keys or URL query strings. Its rejection logs name only a
-category (for example `invalid JSON`) and the peer or robot id, and websockets' own frame-level
-debug output is switched off because frames carry the key.
+The adapter never logs frame contents, keys, URL paths or query strings, rejected robot ids, or
+configuration values. Its rejection logs name only a category (for example `invalid JSON` or
+`robot_id not allowlisted`) and the peer. Configuration errors name the variable and, for allowlist
+entries, the entry's position. Only admitted robot ids are logged. websockets gets a logger that
+never emits or enables DEBUG, whatever the logging configuration: its debug output dumps frames,
+and frames carry the key.
 
 ### Frames
 

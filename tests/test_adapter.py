@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -91,7 +92,10 @@ def _invalid_setups(tmp_path):
         "port-too-large": ({**key, "REACHY_WS_PORT": "65536"}, {}, "outside 1-65535"),
         "port-negative": ({**key, "REACHY_WS_PORT": "-1"}, {}, "outside 1-65535"),
         "malformed-allowlist-entry": (
-            {**port, **key, "REACHY_ALLOWED_ROBOTS": "reachy, robot one"}, {}, "invalid robot id(s) 'robot one'"
+            {**port, **key, "REACHY_ALLOWED_ROBOTS": "reachy, robot one"}, {}, "REACHY_ALLOWED_ROBOTS entry #2 is malformed"
+        ),
+        "allowlist-entry-contains-key": (
+            {**port, **key, "REACHY_ALLOWED_ROBOTS": f"reachy,{SECRET}"}, {}, "REACHY_ALLOWED_ROBOTS entry #2 contains the API key"
         ),
     }
 
@@ -112,6 +116,7 @@ def _invalid_setups(tmp_path):
         "port-too-large",
         "port-negative",
         "malformed-allowlist-entry",
+        "allowlist-entry-contains-key",
     ],
 )
 def test_validate_config_rejects(case, monkeypatch, tmp_path, caplog):
@@ -210,11 +215,6 @@ def test_decode_frame_reports_only_a_category(raw, problem):
     assert (frame == {"type": "hello"}) if not problem else (frame == {})
 
 
-def test_path_for_log_drops_the_query_string():
-    assert adapter._path_for_log(f"/robot/kitchen?api_key={SECRET}") == "/robot/kitchen"
-    assert adapter._path_for_log("/robot/<script>") == "<redacted>"
-    assert adapter._path_for_log("") == ""
-
 
 # ── registration ───────────────────────────────────────────────────────────
 def test_env_enablement_seed(monkeypatch):
@@ -256,3 +256,89 @@ def test_no_private_markers_in_source():
     src = pathlib.Path(adapter.__file__).read_text().lower()
     for marker in ("tars", "manfred", "192.168", "spiner", "gap-map"):
         assert marker not in src
+
+
+MARKER = "value-marker-7c1e"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"REACHY_WS_PORT": MARKER, "REACHY_WS_API_KEY": SECRET},
+        {"REACHY_WS_PORT": "8770", "REACHY_WS_API_KEY_FILE": f"/nonexistent/{MARKER}/key"},
+        {"REACHY_WS_PORT": "8770", "REACHY_WS_API_KEY": SECRET, "REACHY_ALLOWED_ROBOTS": f"reachy, {MARKER} x"},
+        {"REACHY_WS_PORT": "8770", "REACHY_WS_API_KEY": SECRET, "REACHY_ALLOWED_ROBOTS": f"{MARKER}-{SECRET}"},
+    ],
+    ids=["port", "key-file-path", "malformed-allowlist-entry", "allowlist-entry-with-key"],
+)
+def test_config_errors_never_echo_values(env, monkeypatch, caplog):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    caplog.set_level(logging.DEBUG, logger="hermes_reachy.adapter")
+    assert adapter.validate_config(_cfg()) is False
+    with pytest.raises(adapter.ReachyConfigError) as excinfo:
+        adapter.ReachyAdapter(_cfg())
+    for text in (caplog.text, str(excinfo.value)):
+        assert MARKER not in text and SECRET not in text
+
+
+# ── fail-safe hook for oversized pre-auth frames ───────────────────────────
+class _FakeProtocol:
+    """Stands in for websockets' protocol; ``reject_mapped`` simulates a release whose
+    ``fail()`` no longer accepts the call the adapter makes."""
+
+    def __init__(self, reject_mapped=False):
+        self.calls = []
+        self.reject_mapped = reject_mapped
+
+    def fail(self, code, reason="", **extra):
+        if self.reject_mapped and int(code) == adapter.CLOSE_POLICY_VIOLATION:
+            raise TypeError("fail() got an unexpected keyword argument")
+        self.calls.append((int(code), reason, extra))
+
+
+def _hooked(protocol, *, authenticated=False):
+    conn = SimpleNamespace(protocol=protocol, authenticated=authenticated, hello_too_large=False)
+    adapter._install_hello_size_hook(conn)
+    return conn
+
+
+def test_hello_size_hook_maps_pre_auth_1009_and_keeps_extra_arguments():
+    conn = _hooked(_FakeProtocol())
+    conn.protocol.fail(1009, "too big", new_option=True)  # a keyword a future release might add
+    conn.protocol.fail(code=1009, reason="too big")
+    assert conn.protocol.calls == [
+        (1008, "frame too large", {"new_option": True}),
+        (1008, "frame too large", {}),
+    ]
+    assert conn.hello_too_large is True
+
+
+def test_hello_size_hook_leaves_other_codes_and_authenticated_connections_alone():
+    conn = _hooked(_FakeProtocol())
+    conn.protocol.fail(1002, "protocol error")
+    assert conn.protocol.calls == [(1002, "protocol error", {})]
+    conn = _hooked(_FakeProtocol(), authenticated=True)
+    conn.protocol.fail(1009, "too big")
+    assert conn.protocol.calls == [(1009, "too big", {})]
+    assert conn.hello_too_large is False
+
+
+def test_hello_size_hook_falls_back_to_1009_on_a_changed_signature(monkeypatch, caplog):
+    monkeypatch.setattr(adapter, "_hook_fallback_logged", False)
+    caplog.set_level(logging.WARNING, logger="hermes_reachy.adapter")
+    conn = _hooked(_FakeProtocol(reject_mapped=True))
+    conn.protocol.fail(1009, "too big", new_option=True)
+    conn.protocol.fail(1009, "too big")
+    # The library's own handling, untouched arguments included; no exception escapes.
+    assert conn.protocol.calls == [(1009, "too big", {"new_option": True}), (1009, "too big", {})]
+    assert conn.hello_too_large is False
+    assert caplog.text.count("cannot map oversized pre-auth frames") == 1  # logged once
+
+
+def test_hello_size_hook_without_a_fail_method(monkeypatch, caplog):
+    monkeypatch.setattr(adapter, "_hook_fallback_logged", False)
+    caplog.set_level(logging.WARNING, logger="hermes_reachy.adapter")
+    conn = _hooked(object())  # no fail() at all: nothing to wrap, nothing raised
+    assert conn.hello_too_large is False
+    assert "cannot map oversized pre-auth frames" in caplog.text
