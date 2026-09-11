@@ -7,11 +7,21 @@ The adapter runs a **WebSocket server**; the robot's voice app connects to it as
 (mic, STT, VAD, TTS synthesis, PCM streaming, half-duplex, barge onset). This adapter
 only carries *text*:
 
-  inbound  (app -> adapter):  {"type":"hello","robot_id":"reachy"}
+  inbound  (app -> adapter):  {"type":"hello","robot_id":"reachy","api_key":"..."}  (first frame)
                               {"type":"stt","text":"...","robot_id":"reachy"}
                               {"type":"interrupt","text":"...","robot_id":"reachy"}
   outbound (adapter -> app):  {"type":"say","message_id":"m1","content":"...","final":false}
                               {"type":"typing","robot_id":"reachy"}
+
+Authentication
+--------------
+The first frame of every connection must be a ``hello`` carrying the shared API key
+(``REACHY_WS_API_KEY`` or ``REACHY_WS_API_KEY_FILE``), sent within ``HELLO_TIMEOUT_S``.
+Its ``robot_id`` must be allowlisted (``REACHY_ALLOWED_ROBOTS``, default ``reachy``;
+``REACHY_ALLOW_ALL_ROBOTS`` accepts any id but still needs the key) and stays fixed for
+the life of the connection. Any failure closes the socket with 1008 (policy violation).
+The gateway's own allowlist / allow-all / pairing checks still run on every message —
+see ``ReachyAdapter.enforces_own_access_policy``.
 
 An inbound "stt"/"interrupt" frame becomes a MessageEvent dispatched via
 ``handle_message``. Because the gateway's default busy-input mode is ``interrupt``,
@@ -33,21 +43,25 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:  # optional dep; check_requirements gates instantiation
     from websockets.asyncio.server import serve as ws_serve
+    from websockets.exceptions import ConnectionClosed
 
     WEBSOCKETS_AVAILABLE = True
 except Exception:  # pragma: no cover - import guard
     ws_serve = None  # type: ignore
+    ConnectionClosed = OSError  # type: ignore  # never raised: connect() bails out first
     WEBSOCKETS_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
@@ -62,6 +76,15 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_ROBOT_ID = "reachy"
+# Loopback: the voice app normally runs on the same machine as the gateway.
+DEFAULT_HOST = "127.0.0.1"
+# Seconds a new connection has to send its authenticating hello frame.
+HELLO_TIMEOUT_S = 10.0
+# RFC 6455 close codes.
+CLOSE_NORMAL = 1000
+CLOSE_POLICY_VIOLATION = 1008
+# Same spelling the gateway accepts for {PLATFORM}_ALLOW_ALL_USERS-style flags.
+_TRUTHY = frozenset({"true", "1", "yes"})
 
 # Correlates outbound frames to the turn that produced them. Set around handle_message()
 # in _dispatch_text; asyncio.create_task copies the current context, so the turn's detached
@@ -96,18 +119,135 @@ class _HandshakeNoiseFilter(logging.Filter):
         return "opening handshake failed" not in msg and "did not receive a valid HTTP request" not in msg
 
 
+# ── configuration ──────────────────────────────────────────────────────────
+class ReachyConfigError(ValueError):
+    """The Reachy platform configuration is unusable; the message says why (never the key)."""
+
+
+@dataclass(frozen=True)
+class _Settings:
+    host: str
+    port: int
+    api_key: bytes = field(repr=False)
+    allowed_robots: frozenset[str]
+    allow_all_robots: bool
+
+
+def _setting(extra: dict[str, Any], key: str, env: str) -> Any:
+    """``PlatformConfig.extra[key]`` when set, else the ``env`` variable ("" if neither)."""
+    value = extra.get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return os.getenv(env, "")
+    return value
+
+
+def _key_bytes(key: str) -> bytes:
+    # Compare bytes, not str: hmac.compare_digest rejects non-ASCII str. surrogatepass keeps
+    # env values decoded with surrogateescape (undecodable bytes) encodable too.
+    return key.encode("utf-8", "surrogatepass")
+
+
+def _parse_port(raw: Any) -> int:
+    text = str(raw).strip()
+    if not text:
+        raise ReachyConfigError("REACHY_WS_PORT is not set")
+    try:
+        port = int(text)
+    except ValueError:
+        raise ReachyConfigError(f"REACHY_WS_PORT={text!r} is not an integer") from None
+    if not 1 <= port <= 65535:
+        raise ReachyConfigError(f"REACHY_WS_PORT={port} is outside 1-65535")
+    return port
+
+
+def _load_api_key(extra: dict[str, Any]) -> bytes:
+    """Inline key (``REACHY_WS_API_KEY``) wins; otherwise read ``REACHY_WS_API_KEY_FILE``."""
+    inline = _setting(extra, "api_key", "REACHY_WS_API_KEY")
+    if not isinstance(inline, str):
+        raise ReachyConfigError("api_key must be a string")
+    if inline.strip():
+        return _key_bytes(inline.strip())
+    key_file = str(_setting(extra, "api_key_file", "REACHY_WS_API_KEY_FILE")).strip()
+    if not key_file:
+        raise ReachyConfigError("no API key configured: set REACHY_WS_API_KEY or REACHY_WS_API_KEY_FILE")
+    path = Path(key_file).expanduser()
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ReachyConfigError(f"API key file {path} is unreadable: {exc.strerror or exc}") from None
+    except UnicodeDecodeError:
+        raise ReachyConfigError(f"API key file {path} is not valid UTF-8") from None
+    if not key:
+        raise ReachyConfigError(f"API key file {path} is empty")
+    return _key_bytes(key)
+
+
+def _parse_robot_ids(raw: Any) -> frozenset[str]:
+    items = raw.split(",") if isinstance(raw, str) else [str(item) for item in raw or ()]
+    return frozenset(item.strip() for item in items if item.strip())
+
+
+def _load_settings(config: Any) -> _Settings:
+    """Single source of truth for validate_config and the adapter; raises ReachyConfigError."""
+    extra = getattr(config, "extra", None) or {}
+    port = _parse_port(_setting(extra, "port", "REACHY_WS_PORT"))
+    host = str(_setting(extra, "host", "REACHY_WS_HOST")).strip() or DEFAULT_HOST
+    api_key = _load_api_key(extra)
+    # Env first, like the gateway's own allowlist check, so both layers see the same list.
+    raw_robots = os.getenv("REACHY_ALLOWED_ROBOTS", "")
+    if not raw_robots.strip():
+        raw_robots = extra.get("allowed_robots") or ""
+    return _Settings(
+        host=host,
+        port=port,
+        api_key=api_key,
+        # Unset, empty or all-blank means the default robot — never an empty allowlist.
+        allowed_robots=_parse_robot_ids(raw_robots) or frozenset({DEFAULT_ROBOT_ID}),
+        # Env only: it is the exact flag the gateway's allow-all check reads.
+        allow_all_robots=os.getenv("REACHY_ALLOW_ALL_ROBOTS", "").strip().lower() in _TRUTHY,
+    )
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _peer(websocket: Any) -> str:
+    addr = getattr(websocket, "remote_address", None)
+    if isinstance(addr, tuple) and len(addr) >= 2:
+        return f"{addr[0]}:{addr[1]}"
+    return "unknown peer"
+
+
 def check_requirements() -> bool:
     """Return whether the WebSocket dependency is available."""
     return WEBSOCKETS_AVAILABLE
 
 
-def validate_config(config: PlatformConfig) -> bool:
-    """Require a port and either an inline key or readable key file."""
+def is_configured(config: PlatformConfig) -> bool:
+    """Gateway ``is_connected`` hook: has the operator opted in (a port is set)?
+
+    Deliberately shallow and silent — it gates auto-enablement and status displays. An
+    enabled platform with an incomplete setup is then refused by ``validate_config``,
+    which logs the reason.
+    """
     extra = getattr(config, "extra", None) or {}
-    port = extra.get("port") or os.getenv("REACHY_WS_PORT", "")
-    api_key = str(extra.get("api_key") or os.getenv("REACHY_WS_API_KEY", "")).strip()
-    key_file = str(extra.get("api_key_file") or os.getenv("REACHY_WS_API_KEY_FILE", "")).strip()
-    return bool(port and (api_key or (key_file and Path(key_file).expanduser().is_file())))
+    return bool(str(_setting(extra, "port", "REACHY_WS_PORT")).strip())
+
+
+def validate_config(config: PlatformConfig) -> bool:
+    """Require a valid port and a usable API key (inline or from a readable, non-empty file)."""
+    try:
+        _load_settings(config)
+    except ReachyConfigError as exc:
+        logger.error("[reachy] platform not started: %s", exc)
+        return False
+    return True
 
 
 class ReachyAdapter(BasePlatformAdapter):
@@ -120,29 +260,29 @@ class ReachyAdapter(BasePlatformAdapter):
     supports_async_delivery = True
 
     @property
-    def authorization_is_upstream(self) -> bool:
-        """Trust identities admitted by the authenticated robot transport."""
+    def enforces_own_access_policy(self) -> bool:
+        """The transport admits only allowlisted robot ids (see ``_is_dm_allowed``).
+
+        When no env allowlist is configured the gateway would otherwise default-deny even
+        the default ``reachy`` robot; with this flag and an ``allowlist`` ``_dm_policy`` it
+        re-checks the sender through ``_is_dm_allowed`` instead. Unlike
+        ``authorization_is_upstream`` (meant for the trusted relay), this keeps the
+        gateway's allowlist, allow-all flag and pairing store in force as a second layer.
+        """
         return True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform("reachy"))
-        extra = getattr(config, "extra", None) or {}
-        self._host: str = str(
-            extra.get("host") or os.getenv("REACHY_WS_HOST", "127.0.0.1") or "127.0.0.1"
-        )
-        self._port: int = int(extra.get("port") or os.getenv("REACHY_WS_PORT", "8770"))
-        self._api_key = str(extra.get("api_key") or os.getenv("REACHY_WS_API_KEY", "")).strip()
-        key_file = str(extra.get("api_key_file") or os.getenv("REACHY_WS_API_KEY_FILE", "")).strip()
-        if not self._api_key and key_file:
-            try:
-                self._api_key = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
-            except OSError as exc:
-                logger.error("[reachy] could not read API key file %s: %s", key_file, exc)
-        configured_robots = extra.get("allowed_robots") or os.getenv("REACHY_ALLOWED_ROBOTS", DEFAULT_ROBOT_ID)
-        if isinstance(configured_robots, str):
-            self._allowed_robots = {item.strip() for item in configured_robots.split(",") if item.strip()}
-        else:
-            self._allowed_robots = {str(item).strip() for item in configured_robots if str(item).strip()}
+        # Same loader as validate_config: a config it rejects raises here, loudly.
+        settings = _load_settings(config)
+        self._host: str = settings.host
+        self._port: int = settings.port
+        self._api_key: bytes = settings.api_key
+        self._allowed_robots: frozenset[str] = settings.allowed_robots
+        self._allow_all_robots: bool = settings.allow_all_robots
+        # Read by the gateway's authorization when no env allowlist is set. Under allow-all
+        # the gateway's own REACHY_ALLOW_ALL_ROBOTS check admits the robot before this.
+        self._dm_policy = "open" if self._allow_all_robots else "allowlist"
         self._server: Optional[Any] = None
         # robot_id -> active websocket connection
         self._robots: Dict[str, Any] = {}
@@ -150,6 +290,31 @@ class ReachyAdapter(BasePlatformAdapter):
         self._turn_ids: Dict[str, str] = {}
         # tool_call_id -> Future awaiting the robot's tool_result (body-tool surface)
         self._tool_futures: Dict[str, "asyncio.Future"] = {}
+        # strong refs to in-flight closes of superseded connections
+        self._closing: set[asyncio.Task] = set()
+
+    def _robot_allowed(self, robot_id: str) -> bool:
+        return self._allow_all_robots or robot_id in self._allowed_robots
+
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """Gateway hook for ``dm_policy: allowlist``: would the transport admit this robot?"""
+        return self._robot_allowed(str(sender_id))
+
+    def _warn_if_gateway_denies_robots(self) -> None:
+        """With GATEWAY_ALLOWED_USERS set and REACHY_ALLOWED_ROBOTS unset, the gateway only
+        admits robot ids listed in GATEWAY_ALLOWED_USERS — say so instead of failing silently."""
+        if self._allow_all_robots or os.getenv("REACHY_ALLOWED_ROBOTS", "").strip():
+            return
+        gateway_ids = _parse_robot_ids(os.getenv("GATEWAY_ALLOWED_USERS", ""))
+        if not gateway_ids or "*" in gateway_ids:
+            return
+        denied = sorted(self._allowed_robots - gateway_ids)
+        if denied:
+            logger.warning(
+                "[reachy] GATEWAY_ALLOWED_USERS is set but REACHY_ALLOWED_ROBOTS is not: the "
+                "gateway will deny robot id(s) %s — set REACHY_ALLOWED_ROBOTS explicitly",
+                ", ".join(denied),
+            )
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -172,6 +337,13 @@ class ReachyAdapter(BasePlatformAdapter):
         # async bridge) — call_robot_tool must execute here or its future never wakes.
         self._loop = asyncio.get_running_loop()
         logger.info("[reachy] ws server listening on %s:%s", self._host, self._port)
+        if not _is_loopback(self._host):
+            logger.warning(
+                "[reachy] listening on non-loopback %s: ws:// carries the API key in plaintext — "
+                "prefer an SSH tunnel or a TLS proxy",
+                self._host,
+            )
+        self._warn_if_gateway_denies_robots()
         return True
 
     async def disconnect(self) -> None:
@@ -203,26 +375,21 @@ class ReachyAdapter(BasePlatformAdapter):
             path = getattr(getattr(websocket, "request", None), "path", "") or ""
         except Exception:
             path = ""
-        robot_id = self._robot_id_from_path(path)
+        robot_id = await self._authenticate(websocket, path)
+        if robot_id is None:
+            return
+        previous = self._robots.get(robot_id)
+        self._robots[robot_id] = websocket
+        if previous is not None and previous is not websocket:
+            # Newest connection wins; close the old socket rather than leaving it orphaned.
+            logger.warning("[reachy] robot %s re-authenticated; closing its previous connection", robot_id)
+            task = asyncio.create_task(previous.close(CLOSE_NORMAL, "superseded by a newer connection"))
+            self._closing.add(task)
+            task.add_done_callback(self._closing.discard)
+        logger.info("[reachy] robot connected: %s (path=%r)", robot_id, path)
         try:
-            raw_hello = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-            hello = self._parse_frame(raw_hello)
-            supplied_key = str(hello.get("api_key") or "")
-            if hello.get("type") != "hello" or not self._api_key or not hmac.compare_digest(
-                supplied_key, self._api_key
-            ):
-                logger.warning("[reachy] rejected unauthenticated robot connection")
-                await websocket.close(code=1008, reason="authentication required")
-                return
-            robot_id = str(hello.get("robot_id") or robot_id).strip() or robot_id
-            if robot_id not in self._allowed_robots:
-                logger.warning("[reachy] rejected robot id %s", robot_id)
-                await websocket.close(code=1008, reason="robot not allowed")
-                return
-            self._robots[robot_id] = websocket
-            logger.info("[reachy] robot connected: %s (path=%r)", robot_id, path)
             async for raw in websocket:
-                robot_id = await self._on_inbound(robot_id, raw, websocket)
+                await self._on_inbound(robot_id, raw)
         except asyncio.CancelledError:  # pragma: no cover
             raise
         except Exception as e:
@@ -231,26 +398,59 @@ class ReachyAdapter(BasePlatformAdapter):
             # only drop the mapping if it still points at this socket
             if self._robots.get(robot_id) is websocket:
                 self._robots.pop(robot_id, None)
-            logger.info("[reachy] robot disconnected: %s", robot_id)
+                logger.info("[reachy] robot disconnected: %s", robot_id)
+            else:
+                logger.info("[reachy] closed a superseded connection for %s", robot_id)
+
+    async def _authenticate(self, websocket: Any, path: str) -> str | None:
+        """Run the hello handshake: return the admitted robot id, or None once closed."""
+        try:
+            raw = await asyncio.wait_for(websocket.recv(), timeout=HELLO_TIMEOUT_S)
+        except TimeoutError:
+            return await self._reject(websocket, f"no hello within {HELLO_TIMEOUT_S:g}s", "hello timeout")
+        except ConnectionClosed:
+            logger.debug("[reachy] %s closed before sending hello", _peer(websocket))
+            return None
+        hello = self._parse_frame(raw)
+        if str(hello.get("type") or "").lower() != "hello":
+            return await self._reject(websocket, "first frame was not a hello", "hello required")
+        supplied = hello.get("api_key")
+        if not isinstance(supplied, str) or not supplied:
+            return await self._reject(websocket, "hello without a string api_key", "api_key required")
+        if not hmac.compare_digest(_key_bytes(supplied), self._api_key):
+            return await self._reject(websocket, "wrong api_key", "authentication failed")
+        claimed = hello.get("robot_id")
+        if claimed is not None and not isinstance(claimed, str):
+            return await self._reject(websocket, "non-string robot_id", "invalid robot_id")
+        robot_id = (claimed or "").strip() or self._robot_id_from_path(path)
+        if not self._robot_allowed(robot_id):
+            return await self._reject(websocket, f"robot id {robot_id[:64]!r} not allowed", "robot not allowed")
+        return robot_id
+
+    @staticmethod
+    async def _reject(websocket: Any, why: str, reason: str) -> None:
+        """Close an unauthenticated connection with 1008; log why, never the key."""
+        logger.warning("[reachy] auth rejected from %s: %s", _peer(websocket), why)
+        await websocket.close(CLOSE_POLICY_VIOLATION, reason)
 
     @staticmethod
     def _robot_id_from_path(path: str) -> str:
         seg = (path or "").strip("/").split("/")[-1].split("?")[0].strip()
         return seg or DEFAULT_ROBOT_ID
 
-    async def _on_inbound(self, robot_id: str, raw: Any, websocket: Any) -> str:
-        """Parse one inbound frame; returns the (possibly updated) robot_id."""
+    async def _on_inbound(self, robot_id: str, raw: Any) -> None:
+        """Handle one post-handshake frame; the connection's robot_id never changes."""
         frame = self._parse_frame(raw)
         if not frame:
-            return robot_id
+            return
 
         ftype = str(frame.get("type") or "").lower()
         if ftype == "hello":
-            return robot_id
+            return
         new_id = str(frame.get("robot_id") or "").strip()
         if new_id and new_id != robot_id:
-            logger.warning("[reachy] ignored robot id change from %s to %s", robot_id, new_id)
-            return robot_id
+            logger.warning("[reachy] dropped %s frame claiming robot id %r on %s's connection", ftype, new_id[:64], robot_id)
+            return
 
         if ftype in ("stt", "interrupt", "text"):
             text = str(frame.get("text") or "").strip()
@@ -264,11 +464,10 @@ class ReachyAdapter(BasePlatformAdapter):
                 fut.set_result(frame.get("result") if isinstance(frame.get("result"), dict) else {})
         else:
             logger.debug("[reachy] unhandled frame type %r from %s", ftype, robot_id)
-        return robot_id
 
     @staticmethod
-    def _parse_frame(raw: Any) -> Dict[str, Any]:
-        """Parse one JSON object frame."""
+    def _parse_frame(raw: Any) -> dict[str, Any]:
+        """Parse one JSON object frame ({} for anything else)."""
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8", errors="replace")
         raw = (raw or "").strip()
@@ -276,7 +475,7 @@ class ReachyAdapter(BasePlatformAdapter):
             return {}
         try:
             frame = json.loads(raw)
-        except Exception:
+        except (ValueError, RecursionError):
             logger.debug("[reachy] non-JSON frame: %r", raw[:80])
             return {}
         if not isinstance(frame, dict):
@@ -471,7 +670,8 @@ def _env_enablement() -> Optional[dict]:
     port = os.getenv("REACHY_WS_PORT", "").strip()
     if not port:
         return None
-    seed: Dict[str, Any] = {"port": int(port)}
+    # A malformed port is reported by validate_config; never raise from the enablement sweep.
+    seed: dict[str, Any] = {"port": int(port) if port.isdigit() else port}
     host = os.getenv("REACHY_WS_HOST", "").strip()
     if host:
         seed["host"] = host
@@ -503,7 +703,10 @@ def register_platform(ctx) -> None:
         adapter_factory=lambda cfg: ReachyAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
-        required_env=["REACHY_WS_PORT"],
+        is_connected=is_configured,
+        # REACHY_WS_PORT stays first (``hermes setup`` shows required_env[0] as the token var);
+        # REACHY_WS_API_KEY_FILE is the accepted alternative to REACHY_WS_API_KEY.
+        required_env=["REACHY_WS_PORT", "REACHY_WS_API_KEY"],
         install_hint="pip install websockets",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="REACHY_HOME_CHANNEL",

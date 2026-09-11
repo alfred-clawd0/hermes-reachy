@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-reachy"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embody a Hermes agent in the Reachy Mini robot: a WebSocket platform adapter (speech in / speech out) plus a bounded body tool (emote/dance/look/stop/head-tracking/chirp)."
 readme = "README.md"
 requires-python = ">=3.11"

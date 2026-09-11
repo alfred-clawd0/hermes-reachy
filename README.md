@@ -21,6 +21,19 @@ It pairs with the [`reachy-hermes-agent`](https://github.com/ai-ag2026/reachy-he
 brain-side runtime and the conversation-app fork, but the plugin only needs the robot voice app
 to speak its small WebSocket protocol (see below).
 
+## Breaking change in 0.2.0
+
+The robot WebSocket now requires authentication. When upgrading from 0.1.x:
+
+- set `REACHY_WS_API_KEY` (or `REACHY_WS_API_KEY_FILE`) — the platform refuses to start without a
+  key, and logs why;
+- update the voice app to send `api_key` in its first `hello` frame (companion change in
+  [`ai-ag2026/reachy_mini_conversation_app`](https://github.com/ai-ag2026/reachy_mini_conversation_app)).
+  Older clients are closed with `1008 api_key required`;
+- the default bind address moved from `0.0.0.0` to `127.0.0.1` — see [Where to bind](#where-to-bind)
+  if the voice app runs on another machine;
+- a connection can no longer change its `robot_id` after the hello.
+
 ## Install
 
 As a pip plugin:
@@ -36,24 +49,76 @@ drop `src/hermes_reachy/` into `~/.hermes/plugins/reachy/` (directory plugin).
 
 ## Configure
 
-Everything is environment-driven — no hosts, ports, or ids are baked in:
+Everything is environment-driven — no hosts, ports, or ids are baked in (see `.env.example`):
 
 ```dotenv
-REACHY_WS_PORT=8770            # the robot voice app connects here (required)
-REACHY_WS_API_KEY=<random>      # shared secret sent in the initial hello frame
-# REACHY_WS_API_KEY_FILE=/path  # alternative: read the shared secret from a file
-# REACHY_WS_HOST=127.0.0.1     # keep loopback when the body app runs on this Mac
-# REACHY_ALLOWED_ROBOTS=      # comma-separated allowlist of robot ids
-# REACHY_ALLOW_ALL_ROBOTS=    # dev only: accept any robot id
-# REACHY_HOME_CHANNEL=        # default robot id for proactive / cron delivery + body tool
+REACHY_WS_PORT=8770             # the robot voice app connects here (required)
+REACHY_WS_API_KEY=<random>      # shared secret the app sends in its first hello (required…)
+# REACHY_WS_API_KEY_FILE=/path  # …or read it from a file instead (REACHY_WS_API_KEY wins if both)
+# REACHY_WS_HOST=127.0.0.1      # bind address (default 127.0.0.1, loopback)
+# REACHY_ALLOWED_ROBOTS=reachy  # comma-separated robot ids; unset or empty = reachy
+# REACHY_ALLOW_ALL_ROBOTS=      # dev only: accept any robot id (the key is still required)
+# REACHY_HOME_CHANNEL=          # default robot id for proactive / cron delivery + body tool
 ```
+
+Generate a key with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and give the
+same value to the voice app. The gateway refuses to start the platform — with the reason in its
+log — when the port is not a valid 1-65535 integer, or no key is configured, or the key file is
+missing, unreadable or empty.
+
+### Where to bind
+
+The default bind address is `127.0.0.1`: the voice app normally runs on the same Mac as Hermes (it
+reaches the robot itself over the network), so the WebSocket never has to leave the machine.
+
+Set `REACHY_WS_HOST=0.0.0.0` only if the voice app runs on **another machine**. `ws://` is not
+encrypted, so on a LAN the API key and every utterance travel in plaintext. Prefer keeping the
+adapter on loopback and reaching it through an SSH tunnel (on the voice-app machine:
+`ssh -N -L 8770:127.0.0.1:8770 you@hermes-host`, then connect to `ws://127.0.0.1:8770`) or a
+TLS-terminating reverse proxy (`wss://`). The adapter logs a warning when it binds a non-loopback
+address.
+
+### Who may talk to the agent
+
+Two layers, both active:
+
+1. **Transport (this adapter)** — the hello must carry the API key, and its `robot_id` must be in
+   `REACHY_ALLOWED_ROBOTS` (default `reachy`) unless `REACHY_ALLOW_ALL_ROBOTS=true`.
+2. **Gateway** — Hermes' usual checks still run on every message: `REACHY_ALLOW_ALL_ROBOTS`, the
+   `REACHY_ALLOWED_ROBOTS` allowlist, `GATEWAY_ALLOWED_USERS`, and approved pairings. When no env
+   allowlist is set at all, the gateway defers to the adapter's allowlist, so the default `reachy`
+   robot works out of the box.
+
+If you set `GATEWAY_ALLOWED_USERS` (for example for Telegram users), the gateway applies it to
+robots too: set `REACHY_ALLOWED_ROBOTS` explicitly (or add the robot ids to
+`GATEWAY_ALLOWED_USERS`). The adapter logs a warning at startup when an allowlisted robot would be
+denied this way.
 
 ## WebSocket protocol
 
 The robot voice app is the client. Frames are JSON.
 
+### Handshake
+
+1. The **first** frame must be a hello, sent within **10 s** of connecting:
+   `{"type":"hello","robot_id":"reachy","api_key":"<REACHY_WS_API_KEY>"}`.
+   If `robot_id` is omitted, the last URL path segment is used (`ws://host:8770/robot/kitchen` →
+   `kitchen`), else `reachy`.
+2. The key is compared in constant time (any UTF-8 string works) and `robot_id` is checked against
+   the allowlist.
+3. Any failure closes the socket with **1008 (policy violation)** and one of these reasons:
+   `hello timeout`, `hello required` (the first frame was not a hello), `api_key required`,
+   `authentication failed`, `invalid robot_id`, `robot not allowed`. These are configuration
+   errors, so a client should not reconnect in a tight loop on 1008.
+4. The `robot_id` is fixed for the life of the connection: later frames that carry a different
+   `robot_id` are dropped, and a second hello is ignored.
+5. If a robot id authenticates while an earlier connection for the same id is still open, the
+   older socket is closed with `1000 superseded by a newer connection`, and the newest one wins.
+
+### Frames
+
 ```
-inbound  (app → adapter):  {"type":"hello","robot_id":"reachy","api_key":"..."}
+inbound  (app → adapter):  {"type":"hello","robot_id":"reachy","api_key":"..."}   (first frame only)
                            {"type":"stt","text":"...","turn_id":"t1","robot_id":"reachy"}
                            {"type":"interrupt","text":"...","robot_id":"reachy"}
                            {"type":"tool_result","tool_call_id":"...","result":{...}}
