@@ -272,6 +272,39 @@ def _key_bytes(key: str) -> bytes:
     return key.encode("utf-8", "surrogatepass")
 
 
+_REDACTED = "[redacted]"
+
+
+def _key_needles(api_key: bytes) -> tuple[str, ...]:
+    """The key as it can appear in text: raw, and JSON-escaped (ASCII-only and UTF-8) for a key
+    inside a JSON document nested in a string. Longest first, so no needle hides another."""
+    key = api_key.decode("utf-8", "surrogatepass")
+    forms = {key, json.dumps(key)[1:-1], json.dumps(key, ensure_ascii=False)[1:-1]}
+    return tuple(sorted((form for form in forms if form), key=len, reverse=True))
+
+
+def _redact(value: Any, needles: tuple[str, ...]) -> Any:
+    """``value`` with every needle in every string (dict keys included, at any depth) replaced
+    by ``[redacted]``. Containers are rebuilt only along paths that changed: the input is never
+    mutated, and a value without the key is returned as the very same object."""
+    if isinstance(value, str):
+        for needle in needles:
+            if needle in value:
+                value = value.replace(needle, _REDACTED)
+        return value
+    if isinstance(value, dict):
+        pairs = [(_redact(k, needles), _redact(v, needles)) for k, v in value.items()]
+        if all(nk is k and nv is v for (nk, nv), (k, v) in zip(pairs, value.items(), strict=True)):
+            return value
+        return dict(pairs)
+    if isinstance(value, (list, tuple)):
+        items = [_redact(item, needles) for item in value]
+        if all(new is old for new, old in zip(items, value, strict=True)):
+            return value
+        return type(value)(items)
+    return value
+
+
 def _os_error_text(exc: BaseException) -> str:
     return (exc.strerror if isinstance(exc, OSError) else None) or type(exc).__name__
 
@@ -419,6 +452,7 @@ class ReachyAdapter(BasePlatformAdapter):
         self._host: str = settings.host
         self._port: int = settings.port
         self._api_key: bytes = settings.api_key
+        self._key_needles = _key_needles(settings.api_key)
         self._allowed_robots: frozenset[str] = settings.allowed_robots
         self._allow_all_robots: bool = settings.allow_all_robots
         # Read by the gateway's authorization when no env allowlist is set. Under allow-all
@@ -680,7 +714,12 @@ class ReachyAdapter(BasePlatformAdapter):
             return
         if not fut.done():
             result = frame.get("result")
-            fut.set_result(result if isinstance(result, dict) else {})
+            # The robot app may echo the key (e.g. in an error string), and the result travels on
+            # to Hermes, which logs tool-error previews: strip the key before it leaves.
+            try:
+                fut.set_result(_redact(result, self._key_needles) if isinstance(result, dict) else {})
+            except RecursionError:
+                fut.set_result({"ok": False, "error": "tool result nested too deeply"})
 
     def _fail_pending_calls(self, websocket: Any) -> None:
         """Fail, at once, the still-open tool calls that were sent on a socket that has closed

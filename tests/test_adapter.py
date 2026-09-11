@@ -7,9 +7,13 @@ hermes-agent is not importable (e.g. a bare CI without it). Run with:
 """
 from __future__ import annotations
 
+import asyncio
+import copy
+import json
 import logging
 import os
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -342,3 +346,37 @@ def test_hello_size_hook_without_a_fail_method(monkeypatch, caplog):
     conn = _hooked(object())  # no fail() at all: nothing to wrap, nothing raised
     assert conn.hello_too_large is False
     assert "cannot map oversized pre-auth frames" in caplog.text
+
+
+
+# ── redaction of tool results ──────────────────────────────────────────────
+def test_redact_replaces_the_key_everywhere_without_mutating_the_input():
+    needles = adapter._key_needles(SECRET.encode())
+    value = {"a": [SECRET, (1, f"<{SECRET}>")], SECRET: {"b": None}, "n": 3.5, "t": True}
+    snapshot = copy.deepcopy(value)
+    out = adapter._redact(value, needles)
+    assert out == {"a": ["[redacted]", (1, "<[redacted]>")], "[redacted]": {"b": None}, "n": 3.5, "t": True}
+    assert value == snapshot  # the robot's object is never mutated
+    clean = {"a": [1, "x", {"b": "y"}], "c": ("z",)}
+    assert adapter._redact(clean, needles) is clean  # nothing to redact: the same object, no copy
+
+
+def test_redact_catches_json_escaped_forms_of_the_key():
+    key = 'clé-🔑-"quoted"'
+    needles = adapter._key_needles(adapter._key_bytes(key))
+    for text in (json.dumps({"k": key}), json.dumps({"k": key}, ensure_ascii=False), f"plain {key} text"):
+        out = adapter._redact(text, needles)
+        assert "[redacted]" in out
+        assert not any(needle in out for needle in needles)
+
+
+async def test_a_pathologically_deep_tool_result_fails_the_call_not_the_connection():
+    reachy = adapter.ReachyAdapter(_cfg(port=8770, api_key=SECRET))
+    fut = asyncio.get_running_loop().create_future()
+    reachy._tool_futures["t1"] = ("reachy", object(), fut)
+    deep = node = {}
+    for _ in range(sys.getrecursionlimit() + 100):
+        node["n"] = {}
+        node = node["n"]
+    reachy._resolve_tool_result("reachy", {"tool_call_id": "t1", "result": deep})  # must not raise
+    assert fut.result() == {"ok": False, "error": "tool result nested too deeply"}

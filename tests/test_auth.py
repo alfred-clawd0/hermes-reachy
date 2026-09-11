@@ -578,3 +578,49 @@ async def test_oversize_mapping_fails_safe_when_websockets_changes(serve, monkey
     assert caplog.text.count("cannot map oversized pre-auth frames") == 1  # logged once
     assert "auth rejected" in caplog.text
     await asyncio.wait_for(reachy.disconnect(), timeout=5.0)  # shutdown isn't stalled
+
+
+
+# ── tool results carrying the key ──────────────────────────────────────────
+async def test_tool_results_are_redacted_before_they_reach_hermes(serve, caplog):
+    from hermes_reachy.body_tool import handle_reachy_body
+
+    caplog.set_level(logging.DEBUG)  # root: every logger at DEBUG
+    caplog.set_level(logging.DEBUG, logger=LOGGER)
+    reachy, url, _ = await serve(api_key=SECRET)
+    async with _client(url) as ws:
+        await _hello(ws, api_key=SECRET)
+        await _until(lambda: "reachy" in reachy._robots)
+        await ws.send("not json")  # an adapter DEBUG record, to prove DEBUG capture is live
+        handler = asyncio.create_task(handle_reachy_body({"action": "emote", "emotion": "happy"}))
+        request = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert request["type"] == "tool_call"
+        result = {
+            "ok": False,
+            "error": f"credential rejected: {SECRET}",
+            "detail": {"echo": SECRET, "attempts": [SECRET, 1, None, {"k": f"x{SECRET}x"}]},
+            SECRET: "the key as a dict key",
+            "raw": json.dumps({"api_key": SECRET}),  # a JSON document nested in a string
+            "count": 3,
+        }
+        await ws.send(json.dumps({"type": "tool_result", "tool_call_id": request["tool_call_id"], "result": result}))
+        returned = await asyncio.wait_for(handler, timeout=5.0)  # what the tool handler hands Hermes
+    assert SECRET not in returned
+    assert json.loads(returned) == {
+        "ok": False,
+        "error": "credential rejected: [redacted]",
+        "detail": {"echo": "[redacted]", "attempts": ["[redacted]", 1, None, {"k": "x[redacted]x"}]},
+        "[redacted]": "the key as a dict key",
+        "raw": json.dumps({"api_key": "[redacted]"}),
+        "count": 3,
+    }
+    # Hermes 0.20.5 logs a preview of a tool error at WARNING (agent/tool_executor.py):
+    #   logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+    # with result_preview = function_result[:200]. Reproduced here with the handler's real output.
+    logging.getLogger("agent.tool_executor").warning(
+        "Tool %s returned error (%.2fs): %s", "reachy_body", 0.01, returned[:200]
+    )
+    assert any(r.name == "agent.tool_executor" and r.levelno == logging.WARNING for r in caplog.records)
+    assert any(r.name == LOGGER and r.levelno == logging.DEBUG for r in caplog.records)
+    assert [r.name for r in caplog.records if SECRET in r.getMessage()] == []
+    assert SECRET not in caplog.text

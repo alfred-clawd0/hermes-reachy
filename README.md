@@ -137,7 +137,8 @@ The robot voice app is the client. Frames are JSON.
 7. A `tool_result` only completes a `tool_call` that was sent to the same robot. If a call is still
    pending when its connection closes (superseded or dropped), it fails at once with
    `{"ok": false, "error": "robot disconnected"}`, unless the robot's replacement connection has
-   already answered it.
+   already answered it. Before a tool result is passed on to Hermes, every occurrence of the
+   API key in it (in any string or key, at any depth) is replaced by `[redacted]`.
 8. A `robot_id` that contains the API key is rejected (`invalid robot_id`).
 
 The adapter never logs frame contents, keys, URL paths or query strings, rejected robot ids, or
