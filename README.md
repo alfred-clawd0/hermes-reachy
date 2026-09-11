@@ -4,6 +4,10 @@ Give your [Hermes Agent](https://github.com/NousResearch/hermes-agent) a physica
 [Reachy Mini](https://www.pollen-robotics.com/reachy-mini/) body — speech in, speech out, and a
 bounded set of expressive body actions.
 
+> This repository is a fork of [ai-ag2026/hermes-reachy](https://github.com/ai-ag2026/hermes-reachy),
+> maintained at [alfred-clawd0/hermes-reachy](https://github.com/alfred-clawd0/hermes-reachy). The original
+> MIT license and author credit are retained.
+
 This is a standalone Hermes **plugin** (per the framework's "ship third-party/hardware
 integrations as a plugin, not in core" rule). It registers two things:
 
@@ -17,8 +21,9 @@ integrations as a plugin, not in core" rule). It registers two things:
   The robot app executes with a **client-side allowlist** and bounded motion; the gateway only
   correlates request and response. No raw motor access.
 
-It pairs with the [`reachy-hermes-agent`](https://github.com/ai-ag2026/reachy-hermes-agent)
-brain-side runtime and the conversation-app fork, but the plugin only needs the robot voice app
+It pairs with the [`reachy-hermes-agent`](https://github.com/alfred-clawd0/reachy-hermes-agent)
+brain-side runtime and the
+[conversation-app fork](https://github.com/alfred-clawd0/reachy_mini_conversation_app/tree/local-agent-backend), but the plugin only needs the robot voice app
 to speak its small WebSocket protocol (see below).
 
 ## Breaking change in 0.2.0
@@ -28,7 +33,7 @@ The robot WebSocket now requires authentication. When upgrading from 0.1.x:
 - set `REACHY_WS_API_KEY` (or `REACHY_WS_API_KEY_FILE`) — the platform refuses to start without a
   key, and logs why;
 - update the voice app to send `api_key` in its first `hello` frame (companion change in
-  [`ai-ag2026/reachy_mini_conversation_app`](https://github.com/ai-ag2026/reachy_mini_conversation_app)).
+  [`alfred-clawd0/reachy_mini_conversation_app`](https://github.com/alfred-clawd0/reachy_mini_conversation_app)).
   Older clients are closed with `1008 api_key required`;
 - the default bind address moved from `0.0.0.0` to `127.0.0.1` — see [Where to bind](#where-to-bind)
   if the voice app runs on another machine;
@@ -41,6 +46,7 @@ As a pip plugin:
 ```bash
 pip install hermes-reachy          # once published
 # or from a clone:
+git clone https://github.com/alfred-clawd0/hermes-reachy.git && cd hermes-reachy
 pip install -e .
 ```
 

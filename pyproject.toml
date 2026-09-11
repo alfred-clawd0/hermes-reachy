@@ -39,7 +39,8 @@ dev = [
 reachy-platform = "hermes_reachy"
 
 [project.urls]
-Homepage = "https://github.com/ai-ag2026/hermes-reachy"
+Homepage = "https://github.com/alfred-clawd0/hermes-reachy"
+Upstream = "https://github.com/ai-ag2026/hermes-reachy"
 
 [tool.setuptools.packages.find]
 where = ["src"]
